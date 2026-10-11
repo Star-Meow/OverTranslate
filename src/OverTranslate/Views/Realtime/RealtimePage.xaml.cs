@@ -176,7 +176,7 @@ public partial class RealtimePage : UserControl
         RealtimeSessionController.Instance.StateChanged += OnSessionStateChanged;
 
         // The direction is set on the edit layer, which says so through MangaModelOptions.
-        MangaModelOptions.Changed += (_, _) => RenderMangaHint();
+        MangaModelOptions.Changed += OnMangaModelOptionsChanged;
         RenderMangaHint();
 
         // Not just the stepper: the start button has to begin unavailable too, because 原文語言
@@ -294,7 +294,13 @@ public partial class RealtimePage : UserControl
                 .Where(language => !LanguageData.IsAutomaticSource(language.Code))
                 .ToList());
         LocalizationService.BindLocalizedItems(TgtLangBox,  LanguageData.TargetLanguages);
-        LocalizationService.BindLocalizedItems(ProviderBox, LanguageData.Providers);
+        // Also where a change to which services are offered lands, on the way back from the settings
+        // page. A running session has this box locked, and keeps its own choice in the list anyway.
+        var settings = SettingsService.Instance.Current;
+        OverTranslate.Controls.ProviderPicker.Bind(
+            ProviderBox,
+            ProviderVisibility.MenuItems(
+                settings, provider as TranslationProvider? ?? settings.Realtime.Provider));
 
         SrcLangBox.SelectedValue  = source;
         TgtLangBox.SelectedValue  = target;
@@ -339,6 +345,8 @@ public partial class RealtimePage : UserControl
     public void Teardown()
     {
         RealtimeSessionController.Instance.StateChanged -= OnSessionStateChanged;
+        // A static event: left attached, it would keep this page and the closed window around it alive.
+        MangaModelOptions.Changed -= OnMangaModelOptionsChanged;
         RealtimeSessionController.Instance.ForgetBlocks();
     }
 
@@ -366,6 +374,8 @@ public partial class RealtimePage : UserControl
 
     // Japanese only, whatever direction the blocks turn out to be; see MangaModelHints.ForRealtimePage.
     private void RenderMangaHint() => MangaHint.Show(vertical: true, SrcLangBox.SelectedValue as string);
+
+    private void OnMangaModelOptionsChanged(object? sender, EventArgs e) => RenderMangaHint();
 
     private void TgtLangBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
