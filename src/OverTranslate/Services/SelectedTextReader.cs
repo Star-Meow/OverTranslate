@@ -41,18 +41,24 @@ internal static class SelectedTextReader
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(15);
 
     /// <summary>
-    /// The most text this will carry into the popup.
+    /// The most text 替換翻譯 will carry over from a selection.
     /// </summary>
     /// <remarks>
-    /// 取詞翻譯 is a single-line box over someone else's window, not a document translator: a
-    /// selection longer than this was a drag that got away, or a Ctrl+A, and pouring it into a
-    /// one-line field gives the user something they cannot read and a translation they did not ask
-    /// for. 文字翻譯 is the window for that, and it is one shortcut away.
+    /// 替換翻譯 pastes its answer straight over the selection with nothing in between to look at
+    /// first: a selection longer than this was a drag that got away, or a Ctrl+A, and replacing it
+    /// whole is not something the user asked for. 取詞翻譯 shows the text in a box before anything
+    /// happens to it, and reads up to <see cref="SourceTextLimit.MaxLength"/> instead.
     /// </remarks>
     public const int MaxLength = 1000;
 
     /// <summary>Runs of whitespace, newlines included.</summary>
     private static readonly Regex Whitespace = new(@"\s+", RegexOptions.Compiled);
+
+    /// <summary>Runs of whitespace within one line.</summary>
+    private static readonly Regex InlineWhitespace = new(@"[^\S\r\n]+", RegexOptions.Compiled);
+
+    /// <summary>Any one line break, whichever convention it was written in.</summary>
+    private static readonly Regex LineBreak = new(@"\r\n|\r|\n", RegexOptions.Compiled);
 
     /// <summary>
     /// Copies the current selection out of the foreground application, restoring the clipboard.
@@ -62,7 +68,9 @@ internal static class SelectedTextReader
     /// the application holding the selection, and the copy would then be sent to a text box that has
     /// nothing in it.
     /// </remarks>
-    public static async Task<string> ReadAsync()
+    /// <param name="maxLength">Where the text is cut.</param>
+    /// <param name="keepLineBreaks">Whether the text keeps its lines — see <see cref="KeepLines"/>.</param>
+    public static async Task<string> ReadAsync(int maxLength, bool keepLineBreaks = false)
     {
         object? snapshot;
         uint before;
@@ -88,13 +96,14 @@ internal static class SelectedTextReader
                 CopyStartTimeout.TotalMilliseconds / PollInterval.TotalMilliseconds);
             var maxCompletionPolls = (int)Math.Ceiling(
                 CopyCompletionTimeout.TotalMilliseconds / PollInterval.TotalMilliseconds);
-            return await PollForCopiedTextAsync(
+            var text = await PollForCopiedTextAsync(
                 before,
                 GetClipboardSequenceNumber,
                 ReadClipboardTextIfAvailable,
                 () => Task.Delay(PollInterval),
                 maxStartPolls,
                 maxCompletionPolls);
+            return Sanitize(text, maxLength, keepLineBreaks);
         }
         catch (Exception ex)
         {
@@ -134,7 +143,7 @@ internal static class SelectedTextReader
             changed |= getSequenceNumber() != before;
 
             if (changed && readText() is { } text)
-                return Sanitize(text);
+                return text;
 
             if (changed)
             {
@@ -176,29 +185,55 @@ internal static class SelectedTextReader
     }
 
     /// <summary>
-    /// Trims the copied text down to one line of at most <see cref="MaxLength"/> characters.
+    /// Trims the copied text down to one line of at most <paramref name="maxLength"/> characters, or
+    /// with <paramref name="keepLineBreaks"/> to tidied lines — see <see cref="KeepLines"/>.
     /// </summary>
     /// <remarks>
-    /// Whitespace is collapsed rather than kept because a selection dragged across a web page or a
-    /// PDF arrives hard-wrapped at whatever width it was laid out to, and those line breaks belong
-    /// to the page rather than to the sentence. Left in, they reach the translation engine as
+    /// Whitespace is collapsed rather than kept by default because a selection dragged across a web
+    /// page or a PDF arrives hard-wrapped at whatever width it was laid out to, and those line breaks
+    /// belong to the page rather than to the sentence. Left in, they reach the translation engine as
     /// sentence boundaries that are not there.
     /// </remarks>
-    public static string Sanitize(string? raw)
-    {
-        var text = Fold(raw);
-        return text.Length <= MaxLength ? text : text[..MaxLength].TrimEnd();
-    }
+    public static string Sanitize(string? raw, int maxLength = MaxLength, bool keepLineBreaks = false) =>
+        Cap(keepLineBreaks ? KeepLines(raw) : Fold(raw), maxLength);
+
+    private static string Cap(string text, int maxLength) =>
+        text.Length <= maxLength ? text : text[..maxLength].TrimEnd();
 
     /// <summary>
     /// Folds the text onto one line, with no cap on its length.
     /// </summary>
     /// <remarks>
-    /// For text the user pasted in on purpose: the cap in <see cref="Sanitize"/> guards against a
-    /// selection that got away, and a paste is no more of a runaway than typing, which has no cap.
+    /// For text the user pasted in on purpose, which the box it lands in caps at its own length.
     /// </remarks>
     public static string Fold(string? raw) =>
         string.IsNullOrWhiteSpace(raw) ? "" : Whitespace.Replace(raw, " ").Trim();
+
+    /// <summary>
+    /// Tidies the text the way <see cref="Fold"/> does, but line by line, keeping the breaks.
+    /// </summary>
+    /// <remarks>
+    /// For 取詞翻譯's 多行輸入, which is for someone who wants an article translated as it was laid
+    /// out. Spaces inside a line are still collapsed and each line is trimmed; a run of blank lines
+    /// becomes one, which is still a paragraph break to every engine. Lines are joined with
+    /// <see cref="Environment.NewLine"/> because that is what a TextBox inserts for Enter, so the
+    /// box never holds two conventions at once.
+    /// </remarks>
+    public static string KeepLines(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+
+        var lines = new List<string>();
+        foreach (var line in LineBreak.Split(raw))
+        {
+            var tidy = InlineWhitespace.Replace(line, " ").Trim();
+            if (tidy.Length == 0 && (lines.Count == 0 || lines[^1].Length == 0)) continue;
+            lines.Add(tidy);
+        }
+
+        while (lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
+        return string.Join(Environment.NewLine, lines);
+    }
 
     /// <summary>
     /// Sends Ctrl+C to whatever has the foreground — see <see cref="KeyboardInput"/> for how the
