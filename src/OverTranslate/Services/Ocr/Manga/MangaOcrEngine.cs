@@ -73,6 +73,7 @@ internal sealed class MangaOcrEngine : IDisposable
     // Guarded by _gate.
     private MangaTextDetector? _detector;
     private MangaTextRecognizer? _recognizer;
+    private MangaColumnDetector? _columns;
     // Guarded by _sync.
     private (MangaUnavailable Kind, string Reason)? _failure;
     private bool _keepWarm;
@@ -187,7 +188,7 @@ internal sealed class MangaOcrEngine : IDisposable
     /// <remarks>
     /// <para>The same check that decides it after the download (<see cref="DirectMlDevice.Choose"/>:
     /// DXGI's adapters with WARP and software ones left out; DirectML.dll is not needed to ask), so a
-    /// machine told "not supported" here is one the models would never have run on, and 301 MB are
+    /// machine told "not supported" here is one the models would never have run on, and 341 MB are
     /// not fetched to find that out. It takes milliseconds and is asked once per run.</para>
     ///
     /// <para>Video memory is not part of it. Integrated graphics report 128–512 MB of their own and
@@ -391,13 +392,28 @@ internal sealed class MangaOcrEngine : IDisposable
             var found = _detector!.Detect(rgb, bitmap.Width, bitmap.Height);
             var detectMs = timer.Elapsed.TotalMilliseconds;
 
+            var luma = new LumaPage(PillowImage.Luma(rgb), bitmap.Width, bitmap.Height);
+            List<RectangleF> text = [.. found.Text.Where(box => !MangaPageLayout.IsLong(box.Bounds, luma)).Select(box => box.Bounds)];
+            List<RectangleF> longBlocks = [.. found.Text.Where(box => MangaPageLayout.IsLong(box.Bounds, luma)).Select(box => box.Bounds)];
+
+            // Where the blocks that may hold more columns than CPT-flex reads at once are to be cut.
+            timer.Restart();
+            int asked = 0;
+            var pieces = new List<IReadOnlyList<RectangleF>?>(text.Count);
+            foreach (var block in text)
+                pieces.Add(MangaColumnCuts.Asks(block) ? Cut(block) : null);
+
             return new MangaDetection(
-                this, rgb, bitmap.Width, bitmap.Height,
-                [.. found.Text.Where(box => !MangaPageLayout.IsLong(box.Bounds)).Select(box => box.Bounds)],
-                [.. found.Text.Where(box => MangaPageLayout.IsLong(box.Bounds)).Select(box => box.Bounds)],
+                this, rgb, bitmap.Width, bitmap.Height, text, pieces, longBlocks,
                 [.. found.Bubbles.Select(box => box.Bounds)],
-                new LumaPage(PillowImage.Luma(rgb), bitmap.Width, bitmap.Height),
-                detectMs);
+                luma,
+                detectMs, timer.Elapsed.TotalMilliseconds, asked);
+
+            IReadOnlyList<RectangleF>? Cut(RectangleF block)
+            {
+                asked++;
+                return MangaColumnCuts.Pieces(_columns!.Detect(rgb, bitmap.Width, bitmap.Height, block), block, luma);
+            }
         }
         catch (OnnxRuntimeException ex)
         {
@@ -406,28 +422,32 @@ internal sealed class MangaOcrEngine : IDisposable
         }
     }
 
-    // Under _gate. Null when inference failed.
-    private List<MangaBlock>? ReadUnderGate(MangaDetection page, IReadOnlyList<int> which)
+    // Under _gate. One reading for each index asked, empty ones included; null when inference failed.
+    private MangaBlock[]? ReadUnderGate(MangaDetection page, IReadOnlyList<int> which)
     {
         try
         {
             var timer = Stopwatch.StartNew();
-            var boxes = which.Select(i => page.Text[i]).ToList();
+            // A block that was cut is read piece by piece, its pieces in the same batches as the rest.
+            var parts = which.Select(i => page.Pieces[i] ?? [page.Text[i]]).ToList();
             var readings = _recognizer!.Read(
                 page.Rgb, page.Width, page.Height,
-                [.. boxes.Select(box => MangaPageLayout.RecognitionCrop(box, page.Width, page.Height))]);
-            var readMs = timer.Elapsed.TotalMilliseconds;
+                [.. parts.SelectMany(pieces => pieces).Select(piece => MangaPageLayout.RecognitionCrop(piece, page.Width, page.Height))]);
+            page.ReadMs += timer.Elapsed.TotalMilliseconds;
 
-            var blocks = boxes
-                .Select((box, i) => new MangaBlock(box, readings[i].Text, readings[i].Confidence))
-                .Where(block => block.Text.Length > 0)
-                .ToList();
-
-            Log.Info(
-                "Manga OCR on {W}x{H}: {Blocks} blocks read of {Found}, {Long} long, {Bubbles} bubbles, detect={Detect:F0}ms read={Read:F0}ms",
-                page.Width, page.Height, blocks.Count, page.Text.Count, page.Long.Count, page.Bubbles.Count,
-                page.DetectMs, readMs);
-            page.ReadMs = readMs;
+            var blocks = new MangaBlock[which.Count];
+            int at = 0;
+            for (int k = 0; k < which.Count; k++)
+            {
+                var read = readings.Skip(at).Take(parts[k].Count).ToList();
+                at += parts[k].Count;
+                double weight = read.Sum(r => Math.Max(1, r.Text.Length));
+                blocks[k] = new MangaBlock(
+                    page.Text[which[k]],
+                    string.Concat(read.Select(r => r.Text)),
+                    read.Sum(r => r.Confidence * Math.Max(1, r.Text.Length)) / weight,
+                    Columns: page.Pieces[which[k]] is not null);
+            }
             return blocks;
         }
         catch (OnnxRuntimeException ex)
@@ -452,47 +472,103 @@ internal sealed class MangaOcrEngine : IDisposable
     {
         private readonly MangaOcrEngine _owner;
         private int _ended;
+        // What ReadAhead began, for ReadAsync to finish the page with.
+        private IReadOnlyList<int> _aheadWhich = [];
+        private Task<MangaBlock[]?>? _ahead;
 
         internal MangaDetection(
             MangaOcrEngine owner, byte[] rgb, int width, int height, List<RectangleF> text,
-            List<RectangleF> longBlocks, List<RectangleF> bubbles, LumaPage luma, double detectMs)
+            IReadOnlyList<IReadOnlyList<RectangleF>?> pieces, List<RectangleF> longBlocks, List<RectangleF> bubbles,
+            LumaPage luma, double detectMs, double cutMs, int cutsAsked)
         {
             _owner = owner;
             Rgb = rgb;
             Width = width;
             Height = height;
             Text = text;
+            Pieces = pieces;
             Long = longBlocks;
             Bubbles = bubbles;
             Luma = luma;
             DetectMs = detectMs;
+            CutMs = cutMs;
+            CutsAsked = cutsAsked;
         }
 
         internal byte[] Rgb { get; }
         internal int Width { get; }
         internal int Height { get; }
 
-        /// <summary>The blocks manga-ocr can read, highest score first.</summary>
+        /// <summary>
+        /// The blocks the manga models read, highest score first.
+        /// </summary>
         internal List<RectangleF> Text { get; }
 
-        /// <summary>Blocks too long for manga-ocr (<see cref="MangaPageLayout.IsLong"/>).</summary>
+        /// <summary>
+        /// For each of <see cref="Text"/>, the pieces it is read in when it was found to be columns
+        /// (<see cref="MangaColumnCuts.Pieces"/>) — one, the block, when it is read whole — and null
+        /// when it was not asked or no columns were found.
+        /// </summary>
+        internal IReadOnlyList<IReadOnlyList<RectangleF>?> Pieces { get; }
+
+        /// <summary>Blocks too long for the manga models (<see cref="MangaPageLayout.IsLong"/>).</summary>
         internal List<RectangleF> Long { get; }
 
         internal List<RectangleF> Bubbles { get; }
         internal LumaPage Luma { get; }
         internal double DetectMs { get; }
+        internal double CutMs { get; }
+        internal int CutsAsked { get; }
         internal double ReadMs { get; set; }
 
         /// <summary>
-        /// Reads the <see cref="Text"/> blocks at the given indices with manga-ocr, all in one batch;
+        /// Begins reading the <see cref="Text"/> blocks at the given indices and returns at once, so
+        /// the GPU reads while the caller decides about the rest; <see cref="ReadAsync"/> finishes the
+        /// page. At most once, before <see cref="ReadAsync"/>.
+        /// </summary>
+        internal void ReadAhead(IReadOnlyList<int> which, CancellationToken cancellationToken)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ended) != 0, this);
+            if (_ahead is not null) throw new InvalidOperationException("Already reading ahead.");
+            if (which.Count == 0) return;
+            _aheadWhich = which;
+            _ahead = Task.Run(() => _owner.ReadUnderGate(this, which), cancellationToken);
+        }
+
+        /// <summary>
+        /// Reads the <see cref="Text"/> blocks at the given indices with manga-ocr, together with any
+        /// begun by <see cref="ReadAhead"/>, and hands them all back in the order of their indices;
         /// null when inference failed, after which the models are not used again until they change.
         /// </summary>
         internal Task<List<MangaBlock>?> ReadAsync(IReadOnlyList<int> which, CancellationToken cancellationToken)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _ended) != 0, this);
-            return which.Count == 0
+            return which.Count == 0 && _ahead is null
                 ? Task.FromResult<List<MangaBlock>?>([])
-                : Task.Run(() => _owner.ReadUnderGate(this, which), cancellationToken);
+                : ReadRestAsync(which, cancellationToken);
+        }
+
+        private async Task<List<MangaBlock>?> ReadRestAsync(IReadOnlyList<int> which, CancellationToken cancellationToken)
+        {
+            // One read at a time: the rest goes in only once what was begun ahead has come out.
+            var ahead = _ahead is null ? [] : await _ahead.ConfigureAwait(false);
+            if (ahead is null) return null;
+            var rest = which.Count == 0
+                ? []
+                : await Task.Run(() => _owner.ReadUnderGate(this, which), cancellationToken).ConfigureAwait(false);
+            if (rest is null) return null;
+
+            var blocks = _aheadWhich.Zip(ahead).Concat(which.Zip(rest))
+                .OrderBy(read => read.First)
+                .Select(read => read.Second)
+                .Where(block => block.Text.Length > 0)
+                .ToList();
+
+            Log.Info(
+                "Manga OCR on {W}x{H}: {Blocks} blocks read of {Found}, {Long} long, {Bubbles} bubbles, detect={Detect:F0}ms read={Read:F0}ms columns: {Asked} asked, {Cut} cut, {Columns:F0}ms",
+                Width, Height, blocks.Count, Text.Count, Long.Count, Bubbles.Count, DetectMs, ReadMs,
+                CutsAsked, Pieces.Count(p => p is { Count: > 1 }), CutMs);
+            return blocks;
         }
 
         /// <summary>The page as <see cref="MangaOcrEngine.ReadAsync"/> has always handed it on.</summary>
@@ -500,7 +576,21 @@ internal sealed class MangaOcrEngine : IDisposable
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _ended, 1) == 0) _owner.EndRead();
+            if (Interlocked.Exchange(ref _ended, 1) != 0) return;
+            // A read begun ahead and never finished with is still on the GPU: the gate is not given
+            // back under it.
+            try
+            {
+                _ahead?.Wait();
+            }
+            catch (AggregateException ex) when (ex.InnerException is not OperationCanceledException)
+            {
+                Log.Warn(ex.InnerException, "A manga read begun ahead failed with nothing waiting for it");
+            }
+            catch (AggregateException)
+            {
+            }
+            _owner.EndRead();
         }
     }
 
@@ -569,6 +659,8 @@ internal sealed class MangaOcrEngine : IDisposable
 
             using (var detectorOptions = Options())
                 _detector = new MangaTextDetector(_store.PathOf("detector"), detectorOptions);
+            using (var columnOptions = Options())
+                _columns = new MangaColumnDetector(_store.PathOf("columns"), columnOptions);
             _recognizer = new MangaTextRecognizer(
                 _store.PathOf("encoder"), _store.PathOf("decoder-cross"), _store.PathOf("decoder-step"),
                 _store.PathOf("vocabulary"), Options, adapter.Index);
@@ -599,8 +691,10 @@ internal sealed class MangaOcrEngine : IDisposable
     {
         if (_detector is null && _recognizer is null) return;
         _detector?.Dispose();
+        _columns?.Dispose();
         _recognizer?.Dispose();
         _detector = null;
+        _columns = null;
         _recognizer = null;
         Log.Info("Manga models released");
     }

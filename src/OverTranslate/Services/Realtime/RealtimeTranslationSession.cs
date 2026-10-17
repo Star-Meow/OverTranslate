@@ -73,11 +73,10 @@ public sealed class RealtimeTranslationSession
     private readonly SemaphoreSlim _translationSlots =
         new(MaxConcurrentTranslations, MaxConcurrentTranslations);
 
-    // The Failed event promises at most one notification per distinct message, and a session-wide
-    // failure — a missing API key, a provider that is down — reaches every region at once. Held
-    // here rather than per region so three regions report it once between them, not three times.
-    private readonly object _failureGate = new();
-    private string? _lastReportedFailure;
+    // A session-wide failure — a missing API key, a provider that is down — reaches every region at
+    // once. Held here rather than per region so three regions report it once between them, and so
+    // the message lasts until every region that failed has got through again.
+    private readonly RealtimeFailureBoard _failures = new();
     private CancellationTokenSource? _cts;
 
     // The loops of the current run, so a stop can tell whether they actually stopped — see
@@ -127,11 +126,22 @@ public sealed class RealtimeTranslationSession
     public event EventHandler<RealtimeRegionUpdate>? RegionUpdated;
 
     /// <summary>
-    /// Raised when a pass fails in a way the user has to know about (a missing API key, an engine
-    /// that is down). Raised on a background thread, and at most once per distinct message so a
-    /// failure that repeats every poll does not turn into a stream of notifications.
+    /// Raised when a region has stopped for good on an error it could not carry on from. Raised on a
+    /// background thread. Failures the region keeps retrying are <see cref="CurrentFailure"/> instead.
     /// </summary>
     public event EventHandler<string>? Failed;
+
+    /// <summary>
+    /// Raised when <see cref="CurrentFailure"/> may have changed. Raised on a background thread;
+    /// read the property when handling it rather than trusting the order these arrive in.
+    /// </summary>
+    public event EventHandler? FailureChanged;
+
+    /// <summary>
+    /// What a failure that is still being retried says (a missing API key, an engine that is down),
+    /// or null once every region that failed has got through again, or the session stopped or paused.
+    /// </summary>
+    public string? CurrentFailure => _failures.Message;
 
     /// <summary>True while <see cref="RunAsync"/> is doing something more than hashing pixels.</summary>
     public event EventHandler<bool>? BusyChanged;
@@ -186,7 +196,7 @@ public sealed class RealtimeTranslationSession
         Interlocked.Exchange(ref _busyRegions, 0);
         // Otherwise a session that ended on a failure would swallow the same one on the next run,
         // which is the run where the user is checking whether they fixed it.
-        ClearFailure();
+        ClearFailures();
 
         Log.Info(
             "Realtime session started: {Count} region(s), {Src}->{Tgt}, capture={Capture}",
@@ -320,6 +330,9 @@ public sealed class RealtimeTranslationSession
         var loops = _loops;
         _loops = [];
         _ = RealtimeLoopWatch.WatchStop(loops, _capture, RealtimeLoopWatch.WarnAfter);
+        // Nothing is being retried once the loops have stopped, so nothing is failing either: a
+        // pause or the way back to framing must not leave the last error up on the bar.
+        ClearFailures();
         // Keep-warm is left alone: a pause and the way back to framing keep the models, and the
         // stop that ends the session lets them go itself.
         // The cache is kept across a stop/edit/start cycle on purpose: the user usually comes back
@@ -427,8 +440,20 @@ public sealed class RealtimeTranslationSession
                     var gateSize = RealtimeGate.SizeFor(frame.Width, frame.Height, gateAlternate);
                     gateAlternate = !gateAlternate;
                     step.Set("gate detect");
-                    var found = await _ocr.TryDetectTextAsync(
-                        frame, sourceLanguage, gateSize, RealtimeGate.MinimumScore, token);
+                    IReadOnlyList<System.Windows.Rect>? found;
+                    try
+                    {
+                        found = await _ocr.TryDetectTextAsync(
+                            frame, sourceLanguage, gateSize, RealtimeGate.MinimumScore, token);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        // The gate runs the same detector a pass does and meets the same faults, so
+                        // it is answered the same way as a failed pass below rather than ending the
+                        // region: the error is shown and this picture waits before it is tried again.
+                        PassFailed(region, state, pump, Capture, ex);
+                        continue;
+                    }
 
                     // Null is "no slot", which is not an answer — treated as this poll not having
                     // happened rather than as an empty region, or a busy moment would read as the
@@ -438,6 +463,9 @@ public sealed class RealtimeTranslationSession
                         skippedPolls++;
                         continue;
                     }
+
+                    // The detector answered, so a gate that threw before this is over.
+                    pump.Recovered(RealtimeFailureStage.Read);
 
                     // On a rescan the strips are already accounted for: only a box outside them can
                     // be text this region does not know about.
@@ -510,7 +538,7 @@ public sealed class RealtimeTranslationSession
                     // Skipped for want of an inference slot. Nothing has been recorded as rendered,
                     // so the same change is still pending and the next poll tries again — which is
                     // the whole point of not queueing.
-                    if (reading.Outcome != PassOutcome.NoSlot) pump.ClearFailure();
+                    if (reading.Outcome != PassOutcome.NoSlot) pump.Recovered(RealtimeFailureStage.Read);
                 }
                 catch (OperationCanceledException)
                 {
@@ -523,9 +551,7 @@ public sealed class RealtimeTranslationSession
                     // changed: the region waits before trying that picture again — see
                     // RealtimeRegionState.FirstWaitAfterFailure. The error stays up until a pass
                     // gets through.
-                    Log.Warn(ex, "Realtime pass failed for region {Region}", region.Id);
-                    pump.Report(DescribeFailure(ex));
-                    state.MarkFailed(Capture);
+                    PassFailed(region, state, pump, Capture, ex);
                 }
                 finally
                 {
@@ -540,12 +566,28 @@ public sealed class RealtimeTranslationSession
         catch (Exception ex)
         {
             Log.Error(ex, "Realtime region {Region} ended unexpectedly", region.Id);
+            // Not retrying any more, so its failure is not one being retried: the end is said once.
+            if (_failures.Forget(region.Id)) RaiseFailureChanged();
             Failed?.Invoke(this, LocalizationService.Format("S.Realtime.SessionAborted", ex.Message));
         }
         finally
         {
             step.Set("ended");
         }
+    }
+
+    // A look at the region that threw: logged, reported, and the picture held back — see
+    // RealtimeRegionState.MarkFailed.
+    private static void PassFailed(
+        RealtimeRegion region,
+        RealtimeRegionState state,
+        RegionTranslationPump pump,
+        Func<IReadOnlyList<Rectangle>?, FrameFingerprint> capture,
+        Exception ex)
+    {
+        Log.Warn(ex, "Realtime pass failed for region {Region}", region.Id);
+        pump.Report(RealtimeFailureStage.Read, DescribeFailure(ex));
+        state.MarkFailed(capture);
     }
 
     private static ValueTask<bool> NextPollAsync(PeriodicTimer timer, StepMarker step, CancellationToken token)
@@ -891,27 +933,23 @@ public sealed class RealtimeTranslationSession
 
     private void RaiseRegionUpdated(RealtimeRegionUpdate update) => RegionUpdated?.Invoke(this, update);
 
-    private void RaiseFailed(string message) => Failed?.Invoke(this, message);
+    private void RaiseFailureChanged() => FailureChanged?.Invoke(this, EventArgs.Empty);
 
-    /// <summary>Reports a failure once, however many regions run into it.</summary>
-    private void ReportFailure(string message)
+    /// <summary>Reports a failure being retried; raised once, however many regions run into it.</summary>
+    private void ReportFailure(int region, RealtimeFailureStage stage, string message)
     {
-        lock (_failureGate)
-        {
-            if (message == _lastReportedFailure) return;
-            _lastReportedFailure = message;
-        }
-
-        RaiseFailed(message);
+        if (_failures.Report(region, stage, message)) RaiseFailureChanged();
     }
 
-    /// <summary>
-    /// Lets the next failure be reported again, after a pass has got through. Any region getting
-    /// through is evidence the trouble has passed, so this is shared too.
-    /// </summary>
-    private void ClearFailure()
+    /// <summary>A stage got through in a region; the failure goes once no region is failing.</summary>
+    private void Recovered(int region, RealtimeFailureStage stage)
     {
-        lock (_failureGate) _lastReportedFailure = null;
+        if (_failures.Recovered(region, stage)) RaiseFailureChanged();
+    }
+
+    private void ClearFailures()
+    {
+        if (_failures.Clear()) RaiseFailureChanged();
     }
 
     /// <summary>
@@ -1050,7 +1088,7 @@ public sealed class RealtimeTranslationSession
     {
         private readonly RealtimePublishOrder _order = new();
 
-        private int _retryRequested;
+        private readonly RealtimeRetryBackoff _retry = new();
 
         /// <summary>Claims the number identifying this pass in the order the region was read.</summary>
         public long NextPass() => _order.NextPass();
@@ -1114,14 +1152,18 @@ public sealed class RealtimeTranslationSession
                         // Drawn as it is, since the other lines are real, but a line shown in its
                         // original text is waiting on a translation. The pixels will not change to ask
                         // for it again, so the retry has to — and the uncached line is all it sends.
+                        // Waited for like any failure: an engine that cannot answer that line now
+                        // will mostly not answer it at the next poll either.
                         var untranslated = translated.Count(line => line.Untranslated);
                         if (untranslated > 0)
                         {
                             Log.Debug(
                                 "Realtime pass region={Region} left {Count} line(s) untranslated, retrying",
                                 region.Id, untranslated);
-                            RequestRetry();
+                            _retry.RequestAfterFailure();
                         }
+                        else
+                            _retry.Succeeded();
                     }
                     else
                         // Worth its own line: it means the region changed again before this answer
@@ -1137,8 +1179,8 @@ public sealed class RealtimeTranslationSession
                 catch (Exception ex)
                 {
                     Log.Warn(ex, "Realtime translation failed for region {Region}", region.Id);
-                    Report(DescribeFailure(ex));
-                    RequestRetry();
+                    Report(RealtimeFailureStage.Translate, DescribeFailure(ex));
+                    _retry.RequestAfterFailure();
                 }
                 finally
                 {
@@ -1161,17 +1203,26 @@ public sealed class RealtimeTranslationSession
                 region.Id,
                 lines,
                 generation ?? session._translationCache.Generation));
+            // The region shows what it should again, so a translation that failed before is over.
+            Recovered(RealtimeFailureStage.Translate);
             return true;
         }
 
-        /// <summary>Reports a failure, but only if it is not the one already reported.</summary>
-        public void Report(string message) => session.ReportFailure(message);
+        /// <summary>Reports a failure this region is retrying; none once the session is stopping.</summary>
+        public void Report(RealtimeFailureStage stage, string message)
+        {
+            // A pass caught by the stop must not put an error back up after the stop cleared it.
+            if (!token.IsCancellationRequested) session.ReportFailure(region.Id, stage, message);
+        }
 
-        public void ClearFailure() => session.ClearFailure();
+        public void Recovered(RealtimeFailureStage stage) => session.Recovered(region.Id, stage);
 
-        private void RequestRetry() => Interlocked.Exchange(ref _retryRequested, 1);
+        private void RequestRetry() => _retry.Request();
 
-        /// <summary>Whether the region should forget what it thinks is on screen and read it again.</summary>
-        public bool TakeRetryRequest() => Interlocked.Exchange(ref _retryRequested, 0) == 1;
+        /// <summary>
+        /// Whether the region should forget what it thinks is on screen and read it again — after a
+        /// failed translation, only once the wait has passed; see <see cref="RealtimeRetryBackoff"/>.
+        /// </summary>
+        public bool TakeRetryRequest() => _retry.TakeRequest();
     }
 }

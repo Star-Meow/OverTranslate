@@ -149,11 +149,77 @@ public class MangaLineGeometryTests
     [InlineData(464, 187, (int)MangaLineDirection.Unsure, (int)MangaReader.Manga)]       // the lines say nothing
     [InlineData(495, 381, (int)MangaLineDirection.Across, (int)MangaReader.ColumnsAcross)] // ja5's caption, 1.30
     [InlineData(600, 100, (int)MangaLineDirection.Across, (int)MangaReader.Manga)]       // a row, and its box says so
-    [InlineData(60, 500, (int)MangaLineDirection.Unsure, (int)MangaReader.Columns)]      // too long, whatever its lines
+    [InlineData(60, 500, (int)MangaLineDirection.Unsure, (int)MangaReader.Manga)]        // a long column: see MangaPageLayout.IsLong
     [InlineData(60, 200, (int)MangaLineDirection.Unsure, (int)MangaReader.Manga)]
     public void WhatMangaOcrCanRead_IsDecidedByTheBoxAndItsLines(
         float width, float height, int lines, int expected) =>
         Assert.Equal((MangaReader)expected, MangaVerticalReader.ReaderFor(new RectangleF(10, 10, width, height), (MangaLineDirection)lines));
+
+    [Fact]
+    public void WhileTheLinesAreMeasured_WholeBatchesOfBlocksTheyCannotChangeAreRead()
+    {
+        var tall = new RectangleF(0, 0, 60, 200);
+        var wide = new RectangleF(0, 0, 300, 100);
+
+        // Five that are manga-ocr's whatever, one that is asked: the first four make a whole batch.
+        Assert.Equal([0, 1, 3, 4], MangaVerticalReader.ReadAhead([tall, tall, wide, tall, tall, tall]));
+        // Not enough for a whole batch: reading them early would add one.
+        Assert.Empty(MangaVerticalReader.ReadAhead([tall, tall, wide, tall]));
+        // Nothing asked, so nothing to wait for.
+        Assert.Empty(MangaVerticalReader.ReadAhead([tall, tall, tall, tall, tall]));
+    }
+
+    [Fact]
+    public void BlocksSentAcross_AreReadByMangaOcrAsWell()
+    {
+        MangaReader[] readers =
+            [MangaReader.Manga, MangaReader.ColumnsAcross, MangaReader.ColumnsDown, MangaReader.Columns, MangaReader.Manga];
+
+        Assert.Equal([0, 1, 4], MangaVerticalReader.MangaReads(readers, []));
+        // What was read ahead is not read again.
+        Assert.Equal([1, 4], MangaVerticalReader.MangaReads(readers, [0]));
+    }
+
+    [Fact]
+    public void AVerticalBalloonTheLinesSentAcross_IsMangaOcrsAfterAll()
+    {
+        // The reported balloon (兄が流れ弾から俺を庇って死んだ。) as the column pipeline read it:
+        // columns, one dropped, and the furigana of 兄 on its own.
+        var groups = Groups("俺を庇って", "死んだ。", "流れ弾から", "あに");
+
+        Assert.False(MangaVerticalReader.ReadsAcross(groups));
+        Assert.False(MangaVerticalReader.TakesColumns(MangaReader.ColumnsAcross, groups));
+    }
+
+    [Theory]
+    [InlineData("IT'S NOT")]
+    [InlineData("WHAT ARE / YOU DOING?")]
+    [InlineData("OPEN ドア")]        // Latin for two characters of three
+    public void EnglishInABoxSentAcross_StaysAcross(string text)
+    {
+        var groups = Groups(text.Split(" / "));
+
+        Assert.True(MangaVerticalReader.ReadsAcross(groups));
+        Assert.True(MangaVerticalReader.TakesColumns(MangaReader.ColumnsAcross, groups));
+    }
+
+    [Theory]
+    [InlineData("I")]                // a letter or two found in kana
+    [InlineData("OK")]
+    [InlineData("あいOKう")]
+    [InlineData("abcあいうえ")]       // three letters, but fewer than half
+    [InlineData("")]
+    public void ALetterOrTwo_OrMostlyKana_DoesNotTurnABlockAcross(string text) =>
+        Assert.False(MangaVerticalReader.ReadsAcross(Groups(text)));
+
+    [Theory]
+    [InlineData((int)MangaReader.Columns)]
+    [InlineData((int)MangaReader.ColumnsDown)]
+    public void LongAndWideBlocks_KeepTheColumnPipelinesReadingWhateverItSays(int reader) =>
+        Assert.True(MangaVerticalReader.TakesColumns((MangaReader)reader, Groups("俺を庇って", "死んだ。")));
+
+    private static List<Services.OcrTextBlock> Groups(params string[] texts) =>
+        [.. texts.Select((text, i) => new Services.OcrTextBlock(text, new System.Windows.Rect(i * 50, 0, 40, 150)))];
 
     [Fact]
     public void TheColumnEnginesSlots_AreTakenAndGivenBackOnceEach()
